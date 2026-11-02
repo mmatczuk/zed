@@ -8725,9 +8725,9 @@ fn version_control_page() -> SettingsPage {
         ]
     }
 
-    fn commit_view_section() -> [SettingsPageItem; 3] {
+    fn commit_view_section() -> [SettingsPageItem; 4] {
         [
-            SettingsPageItem::SectionHeader("Commit View"),
+            SettingsPageItem::SectionHeader("Git Commit View"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Expand Description by Default",
                 description: "Whether newly opened commit views show the full commit description.",
@@ -8782,12 +8782,6 @@ fn version_control_page() -> SettingsPage {
                 metadata: None,
                 files: USER,
             }),
-        ]
-    }
-
-    fn file_diff_section() -> [SettingsPageItem; 2] {
-        [
-            SettingsPageItem::SectionHeader("File Diff"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Show Full File by Default",
                 description: "Whether newly opened file diffs show the full file instead of changes only.",
@@ -8827,7 +8821,6 @@ fn version_control_page() -> SettingsPage {
             git_blame_view_section(),
             branch_picker_section(),
             commit_view_section(),
-            file_diff_section(),
             git_hunks_section(),
         ],
     }
