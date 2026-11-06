@@ -6,7 +6,7 @@ use editor::{
     SelectionEffects, SplittableEditor,
     display_map::{Block, DisplayRow, ToDisplayPoint},
     hover_markdown_style, multibuffer_context_lines,
-    scroll::{Autoscroll, ScrollAnchor},
+    scroll::{Autoscroll, ScrollAnchor, ScrollOffset},
 };
 use futures::{StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -85,6 +85,8 @@ pub struct CommitView {
     message: Entity<Markdown>,
     message_expanded: bool,
     message_scroll_handle: ScrollHandle,
+    header_height: Pixels,
+    header_hidden: bool,
     stash: Option<usize>,
     multibuffer: Entity<MultiBuffer>,
     repository: Entity<Repository>,
@@ -97,6 +99,7 @@ pub struct CommitView {
     /// Whether to show the whole content of each file instead of only its changed hunks.
     show_full_file: bool,
     _editor_subscription: Subscription,
+    _editor_scroll_subscription: Subscription,
     _load_diff_task: Task<Result<()>>,
 }
 
@@ -487,12 +490,16 @@ impl CommitView {
             })
         });
 
+        let editor_scroll_subscription = Self::subscribe_to_editor_scroll(&editor, window, cx);
+
         Self {
             commit,
             editor,
             message,
             message_expanded: commit_view_settings.expand_description,
             message_scroll_handle: ScrollHandle::new(),
+            header_height: Pixels::default(),
+            header_hidden: false,
             multibuffer,
             stash,
             repository,
@@ -504,6 +511,7 @@ impl CommitView {
             reveal_file,
             show_full_file,
             _editor_subscription: editor_subscription,
+            _editor_scroll_subscription: editor_scroll_subscription,
             _load_diff_task: load_diff_task,
         }
     }
@@ -541,6 +549,73 @@ impl CommitView {
                 );
             });
         });
+    }
+
+    /// Hides the commit header while the diff is scrolled down, to give the diff more room.
+    ///
+    /// The header hides only once the diff is scrolled past its height, and the scroll position
+    /// is shifted back by that height so the diff doesn't jump. Hiding earlier would let the
+    /// taller editor clamp the scroll back to the top and show the header again. The header
+    /// shows again at the top without a shift, so explicit scroll targets there stay visible.
+    /// An autoscroll that shows the header is repeated, since the header shrinks the viewport
+    /// it was computed for.
+    fn subscribe_to_editor_scroll(
+        editor: &Entity<SplittableEditor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            editor,
+            window,
+            |this, editor, event: &EditorEvent, window, cx| {
+                let EditorEvent::ScrollPositionChanged { autoscroll, .. } = *event else {
+                    return;
+                };
+                let splittable_editor = editor.read(cx);
+                let focused_editor = splittable_editor.focused_editor().clone();
+                let panes = std::iter::once(splittable_editor.rhs_editor().clone())
+                    .chain(splittable_editor.lhs_editor().cloned())
+                    .collect::<Vec<_>>();
+                // Split panes share one scroll position, but each clamps its horizontal offset
+                // to its own width, so use the pane that reports the widest offset.
+                let Some((pane, mut position)) = panes
+                    .into_iter()
+                    .map(|pane| {
+                        let position = pane.update(cx, |pane, cx| pane.scroll_position(cx));
+                        (pane, position)
+                    })
+                    .max_by(|(_, a), (_, b)| a.x.total_cmp(&b.x))
+                else {
+                    return;
+                };
+
+                let header_hidden = if this.header_hidden {
+                    let header_hidden = position.y > 0.;
+                    if !header_hidden && autoscroll {
+                        focused_editor.update(cx, |editor, cx| {
+                            editor.request_autoscroll(Autoscroll::fit(), cx)
+                        });
+                    }
+                    header_hidden
+                } else {
+                    pane.update(cx, |pane, cx| {
+                        let line_height =
+                            pane.style(cx).text.line_height_in_pixels(window.rem_size());
+                        let header_lines = (this.header_height / line_height) as ScrollOffset;
+                        if position.y <= header_lines {
+                            return false;
+                        }
+                        position.y -= header_lines;
+                        pane.set_scroll_position(position, window, cx);
+                        true
+                    })
+                };
+                if this.header_hidden != header_hidden {
+                    this.header_hidden = header_hidden;
+                    cx.notify();
+                }
+            },
+        )
     }
 
     /// Inserts a loaded file's excerpts into the view, in batches.
@@ -1087,11 +1162,23 @@ impl CommitView {
         };
 
         v_flex()
+            .relative()
             .w_full()
             .py_2p5()
             .gap_2()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
+            .child({
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        this.update(cx, |this, _| this.header_height = bounds.size.height)
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             .child(
                 h_flex()
                     .pr_2p5()
@@ -1788,11 +1875,14 @@ impl Item for CommitView {
                     cx,
                 )
             });
+            let editor_scroll_subscription = Self::subscribe_to_editor_scroll(&editor, window, cx);
             Self {
                 editor,
                 message,
                 message_expanded: self.message_expanded,
                 message_scroll_handle: ScrollHandle::new(),
+                header_height: Pixels::default(),
+                header_hidden: false,
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
                 stash: self.stash,
@@ -1805,6 +1895,7 @@ impl Item for CommitView {
                 reveal_file: self.reveal_file.clone(),
                 show_full_file: self.show_full_file,
                 _editor_subscription: editor_subscription,
+                _editor_scroll_subscription: editor_scroll_subscription,
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))
@@ -1820,7 +1911,9 @@ impl Render for CommitView {
             .on_action(cx.listener(Self::open_file_at_head_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(self.render_header(window, cx))
+            .when(!self.header_hidden, |this| {
+                this.child(self.render_header(window, cx))
+            })
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
